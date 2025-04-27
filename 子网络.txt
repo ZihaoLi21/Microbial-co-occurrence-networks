@@ -1,0 +1,199 @@
+#加载包
+library(Hmisc)
+library(vegan)
+library(igraph)
+setwd("E:\Users\LEE\Desktop\我的论文\北方民族大学\马家滩论文\network\BAC\A")#读取文件路径
+
+df <- read.csv("真菌asv.csv", row.names = 1)#读取文件
+colSums(df)#求和查看每个样本的reads总和
+#使用该代码根据各样本reads总和中的最小值进行抽平
+asv_Flattening = as.data.frame(t(rrarefy(t(df), min(colSums(df)))))
+#查看抽平后的每个样本的reads总和
+colSums(asv_Flattening)
+#将抽平后的表保存为csv文件，由于保存后发现第一行第二及之后的单元格左移，于是先进行下面操作再保存
+asv_Flattening <- data.frame(ASV=rownames(asv_Flattening), asv_Flattening)  #它的意思是你新创建的第一列的行名
+write.table (asv_Flattening, file ="真菌asv抽平.csv",sep =",", quote =FALSE, row.names = FALSE) #结果导出
+
+df <- read.csv("A.csv", row.names = 1)#读取抽平后表格
+colSums(df)#求和查看每个样本的reads总和
+res1 = t(t(df)/colSums(df))#计算相对丰度
+colSums(res1)
+write.table (res1, file ="细菌asv_relative.csv",sep =",", quote =FALSE)
+
+genus <- read.csv('细菌asv_relative.csv', row.name = 1)
+#可选择性操作。1、过滤一些低丰度或低频的类群，保留所有样品相对丰度总和>0.005或0 的属，即去除了只在少部分样品出现的OTU
+genus <- genus[which(rowSums(genus) > 0.01), ]    
+
+#2、筛选相对丰度最高的OTU，例如筛选相对丰度前10%的OTU
+genus$sum<-rowSums(genus)#在最后增加一列sun，为各行的求和结果
+genus <-genus[order(genus$sum, decreasing =TRUE), ] #将sum列按降序进行排列
+genus <-genus[1:ceiling(nrow(genus)*0.4), -ncol(genus)] #向上取整保留前0.4的OTU，-ncol为去掉最后一列
+
+#3、筛选普遍存在的OTU，例如筛选在20%及以上样本中出现的属
+genus1 <- genus
+genus1[genus1>0] <- 1
+genus <- genus[which(rowSums(genus1) >= 4), ]
+
+
+#计算两属之间是否存在丰度变化的相关性，spearman 相关系数
+genus_corr <- rcorr(t(genus), type = 'spearman')
+#genus_corr <- rcorr(t(genus), type = 'pearson')
+
+#将 spearman 相关系数低于 0.4 的关系剔除，即 r>=0.4
+r <- genus_corr$r
+r[abs(r) < 0.6] <- 0
+r[r >= 0.6] <- 1
+r[r <= -0.6] <- -1
+
+p <- genus_corr$P
+p <- p.adjust(p, method = 'BH')    #可选 p 值校正，这里使用 BH 法校正 p 值
+p[p>=0.01] <- 0
+p[p<0.01] <- 1
+
+#根据上述筛选的 r 值和 p 值保留数据
+z <- r * p
+diag(z) <- 0    #将相关矩阵中对角线中的值（代表了自相关）转为 0
+head(z)[1:6,1:6]#查看前六行
+
+#如此便得到了邻接矩阵格式的网络文件（微生物属的相关系数矩阵）
+write.table(data.frame(z, check.names = FALSE), '真菌genus_corr.matrix.csv', col.names = NA, sep = ',', quote = FALSE)
+#获得了微生物属丰度间的相关系数矩阵，已剔除了相关系数过低且不显著的值。
+
+#将邻接矩阵转化为 igraph 网络的邻接列表
+#构建含权的无向网络，权重代表了微生物属间丰度的 spearman 相关系数
+g <- graph_from_adjacency_matrix(z, weighted = TRUE, mode = 'undirected')
+g
+
+#自相关也可以通过该式去除
+g <- simplify(g)
+
+#孤立节点的删除（删除度为 0 的节点）
+g <- delete_vertices(g, names(degree(g)[degree(g) == 0]))
+
+#该模式下，边权重代表了相关系数
+#由于权重通常为正值，因此最好取个绝对值，相关系数重新复制一列
+E(g)$correlation <- E(g)$weight
+E(g)$weight <- abs(E(g)$weight)
+
+#为节点（微生物属）添加属性信息（界门纲目科属 水平注释）
+tax <- read.csv("bactax.csv", row.names = 1)
+tax <- tax[as.character(V(g)$name), ] #匹配节点名称
+#write.table(tax, 'imp_tax.txt', sep = '\t', row.names = FALSE, quote = FALSE)
+
+#在网络中增加节点注释
+V(g)$kingdom <- tax$kingdom
+V(g)$phylum <- tax$phylum
+V(g)$class <- tax$class
+V(g)$order <- tax$order
+V(g)$family <- tax$family
+V(g)$genus <- tax$genus
+V(g)$species <- tax$species
+
+#简要查看网络图
+g
+plot(g)
+
+#边列表
+edge <- data.frame(as_edgelist(g))    #igraph 的邻接列表转为边列表
+edge_list <- data.frame(
+  source = edge[[1]],
+  target = edge[[2]],
+  weight = E(g)$weight,
+  correlation = E(g)$correlation   )
+head(edge_list)
+#write.table(edge_list, 'imp_meadow.txt', sep = '\t', row.names = FALSE, quote = FALSE) ##导出节点表格
+
+#节点属性列表
+node_list <- data.frame(
+  label      = names(V(g)),
+  kingdom    = V(g)$kingdom,
+  phylum     = V(g)$phylum,
+  class      = V(g)$class,
+  order      = V(g)$order,
+  family     = V(g)$family,
+  genus      = V(g)$genus)
+head(node_list)
+#write.table(node_list, 'node_list.txt', sep = '\t', row.names = FALSE, quote = FALSE)##导出边表格
+
+write_graph(g, '真菌network.graphml', format = 'graphml')#graphml 格式，可使用 gephi 软件打开并进行可视化编辑
+#write_graph(g, '细菌network.gml', format = 'gml')#gml 格式，可使用 cytoscape 软件打开并进行可视化编辑
+
+##使用 igraph 包划分子网络
+#输入数据，邻接矩阵
+adjacency_unweight <- read.csv('真菌genus_corr.matrix.csv', row.names = 1, check.names = FALSE)
+#这是一个微生物互作网络，数值“1”表示微生物 OTU 之间存在互作，“0”表示无互作
+adjacency_unweight[adjacency_unweight < 0] <- 1
+head(adjacency_unweight)[1:6]    #邻接矩阵类型的网络数据格式
+
+#邻接矩阵 -> igraph 的邻接列表，获得非含权的无向网络
+g1 <- graph_from_adjacency_matrix(as.matrix(adjacency_unweight), mode = 'undirected', weighted = NULL, diag = FALSE)
+g1    #igraph 的邻接列表数据格式
+
+#读取每个样品的代表 OTU，提取筛选后asv的样本信息
+otu <- genus[as.character(V(g1)$name), ]
+#转换成01矩阵
+otu[otu > 0] <- 1
+
+#根据样本代表节点，从网络中划分与各样本有关的“子网络”，详情 ?subgraph
+#并将所有子网络存储到一个列表（list）里面
+sub_graph <- list()
+for (i in names(otu)) {
+  sample_i <- otu[i]
+  select_node <- rownames(sample_i)[which(sample_i != 0)]
+  sub_graph[[i]] <- subgraph(g1, select_node)
+}
+#sub_graph   #查看子网络
+
+##简单画图展示全局网络或各子网络的结构
+library(phyloseq)
+
+plot_network(g1)  #全局网络
+plot_network(sub_graph$A1)  #以“DLL1”的代表节点划分的“子网络”
+plot_network(sub_graph$A2)  #以“sample2”的代表节点划分的“子网络”
+plot_network(sub_graph$A3)  #以“sample18”的代表节点划分的“子网络”
+plot_network(sub_graph$A4)
+plot_network(sub_graph$A5)
+plot_network(sub_graph$A6)
+##创建空数据框
+sample_name <- c()
+nodes_num <- c()
+edges_num <- c()
+clustering_coefficient <- c()
+degree <- c()
+network_density <- c()
+average_path_length <- c()
+betweenness_centralization <- c()
+#循环计算子网络属性
+# 循环计算子网络属性
+for(i in 1:length(sub_graph)){
+  sample_name <- c(sample_name, names(sub_graph[i]))
+  nodes_num <- c(nodes_num, length(V(sub_graph[[i]])))  #节点数量
+  edges_num <- c(edges_num, length(E(sub_graph[[i]])))  #边数量
+  clustering_coefficient <- c(clustering_coefficient, transitivity(sub_graph[[i]]))  #聚类系数
+  degree <- c(degree, mean(degree(sub_graph[[i]])))  #平均度
+  network_density <- c(network_density, edge_density(sub_graph[[i]])) #网络密度
+  average_path_length <- c(average_path_length, mean_distance(sub_graph[[i]], directed = FALSE))  #平均路径长度
+  betweenness_centralization <- c(betweenness_centralization, centr_betw(sub_graph[[i]])$centralization)  #介数中心性
+}
+
+# 新的 connectance 指数计算
+connectance <- numeric(length(sub_graph))  # 创建一个空向量存储结果
+for(i in 1:length(sub_graph)) {
+  connectance[i] <- edge_density(sub_graph[[i]], loops = FALSE)  # 使用 edge_density 计算 connectance, 关闭环路（loops = FALSE）
+}
+
+# 计算模块度
+modularities <- numeric(length(sub_graph))
+for (i in 1:length(sub_graph)) { 
+  membership <- membership(cluster_walktrap(sub_graph[[i]])) 
+  modularities[i] <- modularity(sub_graph[[i]], membership)
+}
+
+# 汇总子网络属性
+sub_graph_stat <- data.frame(nodes_num, edges_num, clustering_coefficient, degree, network_density, 
+                             average_path_length, betweenness_centralization, modularities, connectance)
+rownames(sub_graph_stat) <- sample_name  # 加入样本名
+head(sub_graph_stat)  # 与各样本有关的“子网络”的拓扑指数
+
+# 输出统计表
+write.csv(sub_graph_stat, '细菌_subnet-拓扑属性.csv', quote = FALSE)
